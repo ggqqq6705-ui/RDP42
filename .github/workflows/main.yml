@@ -1,0 +1,113 @@
+name: Windows Server 2022 + Tailscale + NoMachine + RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-windows:
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    steps:
+      - name: Configure Windows RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name UserAuthentication -Value 1
+
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
+
+      - name: Create RDP User
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "RDP_PASSWORD secret is missing"
+          }
+
+          $secure = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name RDP -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name RDP -Password $secure `
+              -PasswordNeverExpires
+          } else {
+            Set-LocalUser -Name RDP -Password $secure
+          }
+
+          Add-LocalGroupMember -Group "Administrators" `
+            -Member RDP -ErrorAction SilentlyContinue
+
+          Enable-LocalUser -Name RDP
+
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Install NoMachine Server
+        shell: pwsh
+        run: |
+          $url = "https://web9001.nomachine.com/download/10.2/Windows/nomachine-personal-edition_10.2.3_1_x64.exe"
+          $installer = "$env:TEMP\nomachine.exe"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          Start-Process -FilePath $installer `
+            -ArgumentList "/verysilent" -Wait
+
+          $nx = "$env:ALLUSERSPROFILE\NoMachine\nxserver\nxserver.exe"
+
+          if (Test-Path $nx) {
+            & $nx --start nxd
+          } else {
+            throw "NoMachine server installation was not found"
+          }
+
+      - name: Configure Firewall
+        shell: pwsh
+        run: |
+          New-NetFirewallRule `
+            -DisplayName "NoMachine Tailscale Only" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 4000 `
+            -RemoteAddress 100.64.0.0/10 `
+            -Action Allow
+
+          New-NetFirewallRule `
+            -DisplayName "RDP Tailscale Only" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress 100.64.0.0/10 `
+            -Action Allow
+
+      - name: Verify Connections
+        shell: pwsh
+        run: |
+          $ip = tailscale ip -4
+          Write-Host "Windows Server 2022 READY"
+          Write-Host "Tailscale IP: $ip"
+          Write-Host "NoMachine Port: 4000"
+          Write-Host "RDP Port: 3389"
+          Write-Host "NoMachine Username: RDP"
+
+          Start-Sleep -Seconds 5
+          Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+            Where-Object { $_.LocalPort -in 4000,3389 }
+
+      - name: Keep Server Alive
+        shell: pwsh
+        run: |
+          while ($true) {
+            Write-Host "Windows Server and Tailscale are running"
+            Start-Sleep -Seconds 240
+          }
